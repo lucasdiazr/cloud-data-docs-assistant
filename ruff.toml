@@ -1,0 +1,47 @@
+# Configuración Ruff — linter + formatter
+# Docs: https://docs.astral.sh/ruff/
+
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+extend-exclude = [
+    ".venv",
+    "data",
+    "notebooks",
+]
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+    "N",   # pep8-naming
+    "D",   # pydocstyle
+]
+ignore = [
+    "D100", # missing docstring in public module
+    "D104", # missing docstring in public package
+    "D203", # 1 blank line before class docstring (incompatible con D211)
+    "D213", # multi-line summary second line (incompatible con D212)
+    "E501", # line too long (lo gestiona el formatter)
+]
+
+[lint.per-file-ignores]
+"tests/**/*.py" = ["D", "S101"]
+"notebooks/**/*.py" = ["D"]
+"scripts/**/*.py" = ["D"]
+
+[lint.pydocstyle]
+convention = "google"
+
+[format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true

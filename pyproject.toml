@@ -1,0 +1,75 @@
+[project]
+name = "cloud-data-docs"
+version = "0.1.0"
+description = "Asistente RAG que responde preguntas técnicas sobre migración SQL Server a Snowflake consultando documentación oficial pública."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+    { name = "Lucas Diaz Ruarte" }
+]
+keywords = ["rag", "llm", "langchain", "snowflake", "sql-server", "pgvector", "embeddings"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "anthropic>=0.100.0",
+    "beautifulsoup4>=4.14.3",
+    "cohere>=6.1.0",
+    "fastapi>=0.136.1",
+    "httpx>=0.28.1",
+    "langchain>=0.3",
+    "langchain-anthropic>=1.4.3",
+    "langchain-community>=0.4.1",
+    "langchain-openai>=1.2.1",
+    "langchain-postgres>=0.0.17",
+    "llama-index>=0.14.21",
+    "loguru>=0.7.3",
+    "lxml>=6.1.0",
+    "openai>=2.36.0",
+    "pgvector>=0.3.6",
+    "psycopg[binary]>=3.3.4",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.14.1",
+    "python-dotenv>=1.2.2",
+    "sqlalchemy>=2.0.49",
+    "streamlit>=1.57.0",
+    "tiktoken>=0.12.0",
+    "tqdm>=4.67.3",
+    "uvicorn[standard]>=0.46.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.9,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "cloud_data_docs"
+module-root = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+    "mypy>=2.0.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.1.0",
+    "ragas>=0.4.3",
+    "ruff>=0.15.12",
+]
