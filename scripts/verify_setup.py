@@ -47,8 +47,8 @@ def main() -> int:
                 "WHERE extname = ANY(%s) ORDER BY extname;",
                 (list(REQUIRED_EXTENSIONS),),
             )
-            installed = {name: ver for name, ver in cur.fetchall()}
-    except Exception as exc:  # noqa: BLE001
+            installed = dict(cur.fetchall())
+    except Exception as exc:
         print(f"[verify] ERROR conectando a la base de datos: {exc}")
         return 1
 

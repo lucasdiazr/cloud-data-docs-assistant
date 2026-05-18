@@ -78,3 +78,84 @@ Este archivo es parte del portfolio del proyecto.
 
 - **Prompt 2**: scraping y preparación del dataset de documentación oficial de Snowflake (y, en una segunda iteración, de Microsoft Learn para SQL Server).
 - Decisiones a tomar al inicio del Prompt 2: alcance del scrape (URLs raíz), respeto de `robots.txt`, formato intermedio (`data/raw/` en HTML crudo o ya en Markdown).
+
+---
+
+## 2026-05-18 — Sesión 2: pipeline de scraping Snowflake y dataset piloto de 50 docs
+
+### Qué hicimos
+
+- Construido el pipeline asíncrono de scraping en `src/cloud_data_docs/ingestion/`:
+  - `models.py` — Pydantic v2: `ScrapedDocument`, `ScrapingResult`.
+  - `scrapers/base.py` — `BaseScraper` async con `httpx.AsyncClient`, rate limiter (5 req/s), `Semaphore` de concurrencia y reintentos con `tenacity` (exponential backoff).
+  - `scrapers/snowflake.py` — descubrimiento vía `sitemap.xml` con manejo de sitemap-index, clasificación por path.
+  - `extractors/trafilatura_extractor.py` — extracción a Markdown con limpieza de pilcrow (`¶`) y anchor links rotos.
+  - `pipeline.py` — orquestador, muestreo determinista 60/40 (`seed=42`), idempotencia por slug, fail-fast si >30% fallan, `manifest.json` al final.
+  - `scripts/scrape_snowflake.py` — CLI con `typer` y resumen en `rich.Table`.
+  - `scripts/reprocess_snowflake.py` — re-extrae los `.md` desde los HTML crudos sin tocar la red.
+  - `scripts/build_dataset_report.py` — genera `docs/dataset-report.md` a partir del manifest.
+- Tres deps nuevas: `trafilatura`, `tenacity`, `rich`.
+- Dataset piloto cerrado: **48 `.md` finales** (de 50 URLs muestreadas; 2 son páginas reales con <100 palabras).
+- `docs/dataset-report.md` generado con métricas, distribución, lista de URLs y definición explícita de la métrica de calidad.
+- Tests del paquete `ingestion` en `tests/test_ingestion.py` (**11 tests**, todos en verde).
+
+### Decisiones técnicas
+
+- **Discovery vía `sitemap.xml`** en lugar de crawl recursivo. Razón: el sitemap es canónico, declara qué URLs deben ser indexables y evita falsos positivos (páginas duplicadas, traducciones a otros idiomas, snapshots históricos). Coste: una sola petición y parseo XML; sin riesgo de loops.
+- **Rate limit a 5 req/s con `Semaphore(5) + RateLimiter` por intervalo mínimo**. Mantiene un perfil conservador (cumple con cualquier `Crawl-delay` razonable y respeta una infra que no es nuestra) sin necesidad de configurar nada por host.
+- **`tenacity` para reintentos** (`stop_after_attempt(3)` + `wait_exponential`). Aísla la lógica de retry del flujo de extracción; las excepciones HTTP transitorias se reintentan, las de aplicación (`ExtractionError`) no.
+- **Slug-as-filename derivado de la URL** (`en/sql-reference/sql/select` → `en__sql-reference__sql__select`). Reversible, único, idempotente. Esto da la idempotencia del pipeline: si existe `<slug>.md`, se marca `skipped`.
+- **HTML crudo + Markdown limpio en dos carpetas distintas** (`data/raw/` vs `data/processed/`). Permite re-extraer sin re-pagar la red al cambiar el extractor (uso real: ver atascos).
+- **Métrica de gate explícita en el reporte** (`empty_heading_pct ≤ 10%`) y fail-fast si el filtro `MIN_WORDS=100` deja más del 30% de URLs sin `.md`. Forzar el gate dentro del propio script de reporte evita commits que parecen verdes pero arrastran calidad sucia.
+
+### Conceptos nuevos
+
+- **Web scraping ético**. No es solo "respetar `robots.txt`": también identificarse con un User-Agent claro (`cloud-data-docs-assistant/0.1 (educational; github.com/lucasdiazr)`), no martillear (rate limiting), reintentar con backoff (no spam), almacenar el HTML crudo localmente para no re-descargar al iterar, y limitar el alcance a las secciones que de verdad necesitas. Mental model: "el dueño del servidor no debería notar tu paso por sus logs".
+
+- **`robots.txt`**. Archivo en `https://<host>/robots.txt` que declara qué paths puede acceder un bot. La librería `urllib.robotparser` (stdlib) lo carga y permite preguntar `can_fetch(user_agent, url)`. Nuestro pipeline lo lee al entrar al `async with` del scraper y aborta si alguna URL objetivo está prohibida.
+
+- **`sitemap.xml`**. Listado XML que el sitio publica declarando sus URLs canónicas. Puede ser un `urlset` (URLs finales) o un `sitemapindex` (índice de sub-sitemaps). En Snowflake es un urlset plano con ~7.600 entradas; filtramos las que están dentro de `/en/sql-reference/` y `/en/migrations/`.
+
+- **`trafilatura`**. Extractor de "main content" especializado en páginas web. Recibe HTML, devuelve el texto principal sin menús, banners ni footers. Soporta salida en Markdown con enlaces y tablas. Su algoritmo es heurístico (scoring por densidad de texto, ratio link/texto, posición DOM), no perfecto: puede descartar bloques legítimos si están envueltos en decoración de UI (ver atascos).
+
+- **Async + rate limiting con semáforos**. Combinación natural en Python para hacer scraping concurrente sin asfixiar al host: `asyncio.Semaphore(N)` limita cuántas peticiones están "in-flight" a la vez, un `RateLimiter` con `asyncio.Lock + timestamp` espacia los lanzamientos a una tasa máxima. Mental model: "Semaphore = N obreros; RateLimiter = obreros no cogen ticket más rápido que cada T segundos".
+
+- **Idempotencia en pipelines de ingesta**. Propiedad de que ejecutar el mismo pipeline varias veces sobre los mismos inputs produce el mismo output, sin duplicar ni perder trabajo. La implementamos por "presence check" en el sistema de archivos: si existe el `.md` del slug, no se vuelve a descargar. Permite interrumpir y reanudar sin coste extra.
+
+- **Refinamiento de métricas vs falsos positivos** (lección clave de esta sesión, ver atascos).
+
+### Atascos y resoluciones
+
+1. **Bug del path: `migrate` no existe, lo correcto es `migrations`.** En el primer piloto (5 docs) salieron los 5 de `sql-reference`. La causa: yo había filtrado por `/en/migrate/` pero el path real del sitemap es `/en/migrations/` (plural). Lo identifiqué inspeccionando los `<loc>` del sitemap directamente con `curl`. Corregido: `DocSection`, `SECTION_PATHS`, `_sample_balanced` y los tests. Resultado: 3.067 URLs filtradas en lugar de 2.320, ratio 60/40 sql-reference/migrations.
+
+2. **`¶` y anchor links rotos en el output de trafilatura.** Snowflake añade un pilcrow `¶` a cada heading como anchor link visible. Trafilatura los preservaba en el Markdown final (`# Object identifiers[¶](https://docs.snowflake.com#object-identifiers)`). Solución: dos funciones `_clean_markdown` y `_clean_title` con regex que se aplican post-trafilatura. Cubierto con tests.
+
+3. **Gate de calidad fallaba: 48.9% de docs con headings vacíos.** Tras descargar los 50 docs, mi métrica reportó que casi la mitad tenían al menos un heading sin contenido entre él y el siguiente. Patrón dominante: `## Syntax`, `## Generated Code:`, `## Example Code`. Diagnóstico (inspeccionando HTML crudo): los bloques de código de Snowflake están en `<div class="codeblock-wrapper">` con botones "Copy" y "Expand" alrededor del `<pre><code>`. Trafilatura los clasifica como boilerplate por la decoración UI y descarta el `<pre>` entero. **Solución**: pre-procesado del HTML con BeautifulSoup antes de pasarlo a trafilatura — por cada `codeblock-wrapper`, reemplazarlo por un `<pre>` simple con el texto del código. ~30 líneas de código nuevo en `_preprocess_snowflake_html`. Re-procesamos los 48 docs desde el HTML crudo (sin red, sin coste, 13.7 s).
+
+4. **Tras el fix: 10.4%, sigue por encima del 10% — pero por la razón equivocada.** La métrica reportó 5 docs con headings vacíos restantes. Esperaba encontrar otro wrapper escondido (plan B documentado en §5 del plan original). Al inspeccionarlos descubrí que los 3 docs problemáticos de SnowConvert seguían estructura jerárquica: `## Sample Source Patterns` → `### CONTINUE HANDLER Conversion` (sin texto en medio, pero con contenido dentro de las sub-secciones). El `codeblock-wrapper` se estaba capturando correctamente (10/10 en `redshift-continue-handler`). Mi métrica naive contaba "vacío" cualquier `## X` seguido por otro `##+` sin texto, independientemente del nivel — y eso es un **falso positivo cuando el siguiente heading es un hijo**. Refiné la métrica: heading vacío sólo si el siguiente heading es del **mismo nivel o superior**. Con la métrica refinada: **4.2%** (2 docs / 48), gate cumplido con margen.
+
+### Métricas
+
+| Métrica | Antes del fix | Después del fix |
+| --- | --- | --- |
+| `empty_heading_pct` (naive) | 48.9% (22 / 45) | 10.4% (5 / 48) |
+| `total_empty_headings` (naive) | 286 | 103 |
+| `empty_heading_pct` (refined, oficial) | n/a | **4.2%** (2 / 48) |
+| `total_empty_headings` (refined) | n/a | 19 |
+| `word_count_mean` | 783.6 | 1.157.8 (+47.8 %) |
+| `word_count_total` | 35.260 | 55.576 (+57.6 %) |
+| Docs con `.md` final | 45 | 48 (+3 que antes no llegaban a 100 palabras) |
+| Tests | 9 / 9 | **11 / 11** |
+| Greps regresión (`¶`, `[¶](`) | n/a | **0 archivos** ✅ |
+| Coste APIs | 0 USD | 0 USD |
+
+### Lección clave
+
+**Una métrica mal definida puede pasar o fallar un gate por razones equivocadas.** Cuando una métrica falla cerca del umbral (10.4% vs umbral 10%), el reflejo natural es "mejorar la solución para bajar 0.4 puntos". Pero antes hay que preguntarse: *¿la métrica está midiendo lo que quiero medir?* En este caso la respuesta era no: la métrica naive confundía estructura jerárquica con contenido faltante. Refinar la métrica reveló que el fix real (pre-procesado HTML) ya estaba completo, y que los 5 "vacíos" residuales eran ruido del sensor, no del extractor.
+
+Regla operativa que me apunto: **antes de cambiar la solución cuando un gate falla por poco, validar la métrica con inspección manual de los casos límite**. Si la métrica está sesgada, refinarla y documentar el cambio (no esconderlo) es más barato y más correcto que sobre-ingenierizar la solución.
+
+### Pendiente
+
+- **Prompt 3**: chunking + embeddings + carga a `pgvector`. Decisiones a tomar al inicio: estrategia de chunking (tamaño/overlap, partido por estructura), modelo de embeddings (`text-embedding-3-small` por defecto), índice en pgvector (HNSW vs IVFFlat).
+- Antes del Prompt 3, mirar si conviene normalizar espacios en el contenido extraído (Trafilatura introduce algunos espacios extra en código: `SYSTEM $ SEND_…` en lugar de `SYSTEM$SEND_…`).
