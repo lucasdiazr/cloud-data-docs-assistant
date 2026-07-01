@@ -40,29 +40,50 @@ def _clean_title(title: str) -> str:
 
 
 def _preprocess_snowflake_html(html: str) -> str:
-    """Reemplaza los ``<div class="codeblock-wrapper">`` por ``<pre>`` limpios.
+    r"""Normaliza el HTML de Snowflake antes de pasarlo a trafilatura.
 
-    Snowflake docs envuelve cada bloque de código en un wrapper con botones
-    de UI ("Copy", "Expand"). Esa decoración hace que trafilatura clasifique
-    el contenedor como boilerplate y descarte el ``<pre>`` interno. Aquí lo
-    extraemos in-place: por cada wrapper, sustituimos todo el ``<div>`` por
-    un ``<pre>`` que sólo contiene el texto del código.
+    Hace dos cosas, ambas a nivel de extracción (los espacios espurios nunca
+    llegan a generarse, en vez de repararlos con regex después):
+
+    1. **Elimina los ``<wbr>``** (word-break opportunity). Son hints de salto
+       de línea zero-width que Snowflake inserta dentro de identificadores
+       largos en los headings (p.ej. ``SYSTEM$SEND_<wbr>SNOWFLAKE_...``).
+       ``BeautifulSoup.get_text`` los ignora, pero trafilatura los convierte
+       en un espacio, partiendo el identificador (``SYSTEM$SEND_ SNOWFLAKE``).
+       Quitarlos como nodos es inocuo: no cambian el texto, solo el layout.
+
+    2. **Reemplaza cada ``<div class="codeblock-wrapper">`` por un ``<pre>``
+       limpio.** El wrapper lleva botones de UI ("Copy", "Expand") que hacen
+       que trafilatura clasifique el contenedor como boilerplate y descarte
+       el ``<pre>`` interno. Extraemos el texto del ``<pre>`` con
+       ``get_text("")`` (SIN separador): el código viene troceado en spans de
+       syntax-highlighting (``<span class="hljs-*">``); usar ``"\n"`` como
+       separador metía un salto entre cada token y trafilatura luego los
+       re-unía con espacios (``ANY ( array )``). Sin separador, los tokens se
+       concatenan tal cual y solo sobreviven los saltos de línea reales del
+       propio código.
 
     Args:
         html: HTML crudo de la página.
 
     Returns:
-        HTML con los wrappers reemplazados por ``<pre>`` simples. Si el
-        HTML no contiene wrappers, se devuelve sin modificar (early-return).
+        HTML normalizado. Si no hay ``codeblock-wrapper`` ni ``<wbr>``, se
+        devuelve sin modificar (early-return por rendimiento).
     """
-    if not html or "codeblock-wrapper" not in html:
+    if not html or ("codeblock-wrapper" not in html and "<wbr" not in html):
         return html
     soup = BeautifulSoup(html, "lxml")
+
+    # (1) Headings: quitar los <wbr> antes de que trafilatura los vea.
+    for wbr in soup.find_all("wbr"):
+        wbr.decompose()
+
+    # (2) Código: <pre> limpio con el texto concatenado sin separador.
     for wrapper in soup.select("div.codeblock-wrapper"):
         pre = wrapper.find("pre")
         if pre is None:
             continue
-        text = pre.get_text("\n", strip=False)
+        text = pre.get_text("")
         new_pre = soup.new_tag("pre")
         new_pre.string = text
         wrapper.replace_with(new_pre)

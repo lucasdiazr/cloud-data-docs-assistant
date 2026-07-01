@@ -159,3 +159,77 @@ Regla operativa que me apunto: **antes de cambiar la solución cuando un gate fa
 
 - **Prompt 3**: chunking + embeddings + carga a `pgvector`. Decisiones a tomar al inicio: estrategia de chunking (tamaño/overlap, partido por estructura), modelo de embeddings (`text-embedding-3-small` por defecto), índice en pgvector (HNSW vs IVFFlat).
 - Antes del Prompt 3, mirar si conviene normalizar espacios en el contenido extraído (Trafilatura introduce algunos espacios extra en código: `SYSTEM $ SEND_…` en lugar de `SYSTEM$SEND_…`).
+
+---
+
+## 2026-07-01 — Sesión 3: chunking, embeddings y carga a pgvector (Parte A)
+
+Sesión larga y de cierre de fase. Objetivo: convertir los 48 `.md` en chunks vectorizados y cargarlos en pgvector, dejando el pipeline de ingesta listo para que el retrieval (Parte B) tenga de dónde tirar. A mitad apareció un bug de calidad de datos que obligó a un desvío de causa raíz; quedó documentado abajo porque es la parte más instructiva.
+
+### Qué hicimos
+
+- **Paquete `db/`** nuevo:
+  - `connection.py` — `get_connection()` (psycopg síncrona) y `get_async_connection()`. Cero conexiones en import-time. Detalle no obvio: `Settings.postgres_dsn` está en formato SQLAlchemy (`postgresql+psycopg://`), que psycopg **crudo rechaza**; construimos el DSN nativo (`postgresql://`) desde los mismos campos.
+  - `migrations.py` — `run_migrations(conn)` idempotente (todo `CREATE ... IF NOT EXISTS`): tabla `chunks`, índice HNSW `vector_cosine_ops`, índices btree en `section` y `doc_url`. No hace commit: lo decide el llamador.
+- **`ingestion/chunker.py`** — chunking structure-aware (ver concepto abajo). `load_markdown_doc()` parsea frontmatter YAML + body; `chunk_document()` parte por headers, sub-parte por tokens y mergea los fragmentos diminutos. `count_tokens()` con tiktoken `cl100k_base` es la unidad canónica de longitud de todo el pipeline.
+- **`ingestion/embedder.py`** — `embed_texts()` en batches de 100 con reintentos `tenacity`; `estimate_cost()` calcula tokens y coste **antes** de gastar (clave para la política de costes del proyecto).
+- **`ingestion/indexer.py`** — orquesta carga→chunk→coste→embeddings→upsert. `dry_run` corta antes de OpenAI/DB. Idempotencia vía `ON CONFLICT (doc_url, chunk_index) DO UPDATE` + **limpieza de huérfanos** (ver decisiones).
+- **`scripts/index_dataset.py`** — CLI typer: `--dry-run`, `--pilot` (5 docs, seed 42), o completo. Tabla `rich` de resumen.
+- **Fix de calidad de datos** en `extractors/trafilatura_extractor.py` + reproceso de los 48 `.md` (el desvío de esta sesión).
+- Tests nuevos: `test_chunker.py` (5), `test_embedder.py` (5), +2 en `test_ingestion.py`. Suite total: **22 verde**.
+
+### Decisiones técnicas
+
+- **Chunking structure-aware, no tamaño fijo.** Partimos primero por headings (`#`/`##`/`###`) con `MarkdownHeaderTextSplitter` y solo sub-partimos (con `RecursiveCharacterTextSplitter`) las secciones que superan el target. Razón: en documentación de referencia, la unidad semántica natural es la sección (una función, un parámetro, un ejemplo). Cortar por tamaño fijo mezclaría el final de una sección con el principio de otra y ensuciaría el embedding. **Consecuencia medida y aceptada**: la mayoría de chunks quedan por debajo del target de 900 (mediana ~233 tokens) porque las secciones de Snowflake son cortas. El "900" actúa como techo, no como objetivo. Damos por buena la coherencia semántica sobre la uniformidad de tamaño; si el retrieval sufre, lo reajustamos con datos de Ragas, no por intuición.
+- **Medir longitud en tokens, no en caracteres.** `RecursiveCharacterTextSplitter` usa `length_function=count_tokens`, de modo que `chunk_size`/`overlap` se expresan en tokens con el **mismo tokenizer que el modelo de embeddings** (`cl100k_base`). Así el presupuesto de chunk se alinea con lo que de verdad consume el embedding.
+- **Índice HNSW con `vector_cosine_ops`** (ver definición de vector DB / HNSW, entrada 2026-05-12). Elegimos coseno porque los embeddings de OpenAI vienen normalizados y es la métrica estándar para similitud semántica. HNSW sobre IVFFlat: mejor recall a coste de más memoria; irrelevante a esta escala (318 vectores).
+- **Idempotencia por upsert + limpieza de huérfanos.** `ON CONFLICT DO UPDATE` evita duplicados al re-indexar. Pero descubrimos un caso que el upsert **no** cubre: si un doc pasa de 6 a 4 chunks (porque el texto cambió), las filas con `chunk_index` 4 y 5 del run anterior quedan **huérfanas** — el upsert solo toca 0..N-1. Solución integrada en el indexer: tras insertar, por cada doc `DELETE WHERE chunk_index >= nuevo_count`, todo en la **misma transacción**. Preventivo, no reactivo.
+- **Estimación de coste antes de gastar.** El indexer calcula tokens×precio y (si supera umbral) pide confirmación. Coste real de indexar los 48: **$0.0019**. Trivial, pero el patrón es lo que importa de cara a corpus más grandes.
+- **Fix de extracción sobre fix de reparación.** Ante el bug de espacios (abajo), la regla que seguimos: preferir que el espacio nunca se genere (arreglar la extracción) antes que quitarlo con regex después. Más robusto y sin riesgo de corromper prosa.
+
+### Conceptos nuevos
+
+- **Chunking structure-aware.** Estrategia de chunking (ver concepto general, entrada 2026-05-12) que usa la estructura del documento como guía de corte. Mental model: **"los headings deciden DÓNDE cortar; el límite de tokens decide CUÁNTAS veces cortar dentro de una sección demasiado larga"**. El overlap solo aplica al sub-partir secciones largas, no entre secciones distintas (ahí el límite ya es semántico).
+
+- **`tiktoken` y por qué medir en tokens.** El tokenizer que usa el modelo. Un token ≈ 4 caracteres en inglés, pero varía mucho con código y símbolos. Medir chunks en tokens (y no en caracteres o palabras) alinea el tamaño del chunk con el límite real del modelo y con el coste (que se factura por token). `cl100k_base` es el de `text-embedding-3-small` y de la familia GPT-4.
+
+- **Upsert (`ON CONFLICT DO UPDATE`) y chunks huérfanos.** Upsert = "inserta, y si ya existe (viola un UNIQUE), actualiza". Da idempotencia barata. El gotcha de los **huérfanos**: cuando la clave natural es compuesta y posicional (`doc_url` + `chunk_index`) y el número de posiciones puede **encoger** entre runs, las posiciones sobrantes del run viejo sobreviven al upsert. Mental model: "el upsert pisa lo que vuelves a escribir, pero no barre lo que ya no escribes". Hay que barrerlo aparte.
+
+- **`<wbr>` (word break opportunity).** Tag HTML zero-width que marca dónde un navegador **puede** romper una palabra larga si no cabe. No añade texto visible. Relevante aquí porque distintos extractores lo tratan distinto: BeautifulSoup lo ignora en `get_text()`, pero trafilatura lo convierte en un espacio real (ver atasco).
+
+### Atascos y resoluciones
+
+**El bug de los espacios: investigación de causa raíz.** En la validación del piloto, los chunks mostraban dos tipos de ruido: identificadores partidos en headings (`SYSTEM$SEND_ SNOWFLAKE_ NOTIFICATION`) y código con espacios espurios (`ARRAY [ 1 , 2 , 3 ]`). En lugar de tapar con regex, fuimos a la causa raíz en el HTML crudo (con BeautifulSoup):
+
+1. **Headings.** `h1.get_text()` daba el identificador **limpio** — el HTML no tenía los espacios. Los introducía **trafilatura** al convertir los `<wbr/>` (que Snowflake mete dentro de identificadores largos) en espacios. Fix: `decompose()` de los `<wbr>` en el pre-procesado HTML, antes de trafilatura.
+2. **Código.** Los `<pre>` traían el código troceado en spans de syntax-highlighting (`<span class="hljs-keyword">ANY</span><span class="hljs-punctuation">(</span>...`). Nuestro `_preprocess_snowflake_html` los unía con `pre.get_text("\n", strip=False)` → un salto de línea entre **cada** token → trafilatura, que no los trata como bloque de código (los `.md` no usan fenced blocks), re-unía esas líneas con espacios. Fix: `pre.get_text("")` (sin separador) → los tokens se concatenan tal cual y solo sobreviven los saltos de línea reales del código.
+
+Ambos fixes se validaron end-to-end sobre los 2 HTML reales antes de tocar el módulo. Después: reproceso de los 48 `.md` desde HTML crudo (sin red, $0, 14 s), verificación por greps (0 headings partidos, 0 regresión de pilcrow, `ARRAY[1, 2, 3]` correcto), y variación de `word_count` de **−8.83%** (esperado: menos espacios = menos "palabras", dentro del margen ±10%).
+
+**Verificación de string literals.** Preocupación explícita: que la normalización no rompiera literales entre comillas. Confirmado en un chunk de `CREATE SECRET`: `OAUTH_SCOPES = ('useraccount') COMMENT = 'secret for the service now connector'` queda intacto. El fix de extracción no toca prosa ni strings porque opera solo dentro de `<pre>` y sobre `<wbr>`.
+
+### Métricas
+
+| Métrica | Valor |
+| --- | --- |
+| Docs indexados | 48 |
+| Chunks totales en `chunks` | **318** (295 creados + 23 actualizados) |
+| Distribución | migrations 166 / sql-reference 152 |
+| Tokens (chunk): min / mediana / max | 50 / 233 / 964 |
+| Tokens totales embebidos | 94.152 |
+| Coste real acumulado (embeddings) | **$0.0019** |
+| `word_count` corpus antes → después del reproceso | 55.576 → 50.669 (−8.83%) |
+| Huérfanos / duplicados en DB | 0 / 0 |
+| Tests | **22 / 22** verde |
+| Ruido residual (heading_path / content) | 0 / 0 |
+
+### Lección clave
+
+**El fix del Prompt 2 introdujo este bug, y los gates de aquel momento no lo detectaron.** El pre-procesado de `codeblock-wrapper` (Sesión 2) fue lo que empezó a extraer el código de los `<pre>` — y con él, el `get_text("\n")` que fragmentaba los tokens. Aquel gate medía *headings vacíos* (¿capturamos el bloque de código?), y lo pasaba: el código **sí** se capturaba. Pero nadie medía la *integridad del espaciado* de ese código. **Un gate mide lo que mide; pasar un gate no es "está bien", es "está bien en la dimensión que ese gate observa".** Regla que me llevo, complementaria a la de la Sesión 2 (validar la métrica): **cuando un fix cambia una salida, añade un gate que observe la nueva dimensión que ese fix podría romper.** El fix de código necesitaba un gate de espaciado, no solo de "hay código".
+
+Segundo apunte, de método: **ir a causa raíz en el HTML crudo antes de escribir un solo regex** ahorró un fix frágil. La diferencia entre BeautifulSoup (ignora `<wbr>`) y trafilatura (lo vuelve espacio) solo se ve mirando el dato, no razonando desde el markdown ya corrupto.
+
+### Pendiente
+
+- **Parte B del Prompt 3**: retrieval. Vector search sobre `chunks` (similitud coseno con el índice HNSW), query transformation, y montar el primer bucle RAG de punta a punta (retrieval → prompt → LLM). Decisiones a tomar al inicio: `top_k` de recuperación, si añadir búsqueda híbrida con `pg_trgm` desde ya o dejarlo para después, y qué modelo de generación usar para las primeras pruebas (`gpt-4o-mini` por defecto).
+- Cuando entre re-ranking (Cohere), medir el delta de precisión con Ragas contra el baseline sin re-rank.

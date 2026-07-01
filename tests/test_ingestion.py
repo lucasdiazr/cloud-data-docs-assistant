@@ -72,9 +72,65 @@ def test_preprocess_unwraps_snowflake_codeblock() -> None:
 
 
 def test_preprocess_passthrough_when_no_wrappers() -> None:
-    """Si el HTML no contiene ningún `codeblock-wrapper`, se devuelve sin cambios."""
+    """Sin `codeblock-wrapper` ni `<wbr>`, el HTML se devuelve sin cambios."""
     html = "<html><body><p>hola</p></body></html>"
     assert _preprocess_snowflake_html(html) is html
+
+
+def test_preprocess_removes_wbr_from_headings() -> None:
+    """Los `<wbr>` de un heading se eliminan, dejando el identificador intacto.
+
+    trafilatura convierte `<wbr>` en un espacio, partiendo identificadores como
+    `SYSTEM$SEND_SNOWFLAKE_NOTIFICATION`. Al quitarlos como nodos antes de
+    trafilatura, el espacio espurio nunca llega a generarse.
+    """
+    html = (
+        "<html><body>"
+        "<h1>SYSTEM$SEND_<wbr/>SNOWFLAKE_<wbr/>NOTIFICATION</h1>"
+        "</body></html>"
+    )
+    out = _preprocess_snowflake_html(html)
+    soup = BeautifulSoup(out, "lxml")
+
+    assert soup.find("wbr") is None
+    assert soup.find("h1").get_text() == "SYSTEM$SEND_SNOWFLAKE_NOTIFICATION"
+
+
+def test_preprocess_joins_highlighting_spans_without_spurious_spaces() -> None:
+    """El `<pre>` con spans de highlighting queda con los tokens bien unidos.
+
+    Cada token de código viene en su propio `<span class="hljs-*">`. Con
+    `get_text("")` los spans se concatenan tal cual (sin meter separadores),
+    de modo que `(` `1` `)` quedan pegados como `(1)` y NO como `( 1 )`. Los
+    saltos de línea reales del código multilínea deben sobrevivir.
+    """
+    html = (
+        "<html><body>"
+        '<div class="codeblock-wrapper relative">'
+        '<button class="codeblock-button">Copy</button>'
+        "<pre>"
+        '<span class="hljs-keyword">SELECT</span> '
+        '<span class="hljs-punctuation">(</span>'
+        '<span class="hljs-number">1</span>'
+        '<span class="hljs-punctuation">)</span>'
+        "\n"
+        '<span class="hljs-keyword">FROM</span> dual;'
+        "</pre>"
+        "</div>"
+        "</body></html>"
+    )
+    out = _preprocess_snowflake_html(html)
+    soup = BeautifulSoup(out, "lxml")
+    pre = soup.find("pre")
+    assert pre is not None
+    text = pre.get_text()
+
+    # Tokens bien unidos: sin espacios espurios alrededor de los paréntesis.
+    assert "(1)" in text
+    assert "( 1 )" not in text
+    # Salto de línea legítimo del código multilínea preservado.
+    assert "\n" in text
+    assert "FROM dual;" in text
 
 
 def test_model_serializes_correctly() -> None:
